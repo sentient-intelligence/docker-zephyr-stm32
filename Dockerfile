@@ -1,10 +1,10 @@
-# Zephyr development image for Espressif targets (e.g. ESP32)
+# Zephyr development image for STM32 targets (e.g. STM32F40x)
 
 # Settings
 ARG UBUNTU_VERSION=24.04
-ARG USERNAME="zephyr-builder"
-ARG PASSWORD="zephyr"
-# ARG ZEPHYR_RTOS_VERSION=4.2.0
+ARG HOSTTYPE="x86_64"
+ARG USERNAME="root"
+ARG PSWD="zephyr"
 # Use commit instead of version to stay consistent across builds
 ARG ZEPHYR_RTOS_COMMIT=21c942f18c7f6a4338752ca5c39a746f1034393b
 ARG TOOLCHAIN_LIST="-t arm-zephyr-eabi -t aarch64-zephyr-elf"
@@ -27,7 +27,7 @@ FROM ubuntu:${UBUNTU_VERSION}
 
 # Redeclare arguments after FROM
 ARG USERNAME
-ARG PASSWORD
+ARG PSWD
 ARG ZEPHYR_RTOS_VERSION
 ARG ZEPHYR_RTOS_COMMIT
 ARG VS_CODE_SERVER_VERSION
@@ -40,6 +40,7 @@ ARG TOOLCHAIN_LIST
 ARG WGET_ARGS
 ARG VIRTUAL_ENV
 ARG TARGETARCH
+ARG HOSTTYPE
 
 #-------------------------------------------------------------------------------
 # Set default shell during Docker image build to bash
@@ -85,14 +86,11 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get -y update && \
 
 #-------------------------------------------------------------------------------
 # Add user and relevant settings
-RUN useradd -d /opt/${USERNAME} -m -s /bin/bash ${USERNAME}
-RUN usermod -aG sudo ${USERNAME}
-RUN mkdir -p /opt/zephyr
-RUN echo "${USERNAME}:${PASSWORD}" | chpasswd
-USER ${USERNAME}
+RUN echo "${USERNAME}:${PSWD}" | chpasswd
 
 # Set up a Python virtual environment
 ENV VIRTUAL_ENV=${VIRTUAL_ENV}
+RUN mkdir -p ${VIRTUAL_ENV}
 RUN python3 -m venv ${VIRTUAL_ENV}
 ENV PATH="${VIRTUAL_ENV}/bin:$PATH"
 
@@ -130,38 +128,95 @@ RUN cd /opt/toolchains && \
     git clone https://github.com/zephyrproject-rtos/zephyr.git && \
     cd zephyr && \
     git checkout ${ZEPHYR_RTOS_COMMIT} && \
-    python3 -m pip install -r scripts/requirements-base.txt && \
-	ZEPHYR_SDK_VERSION="v$(cat SDK_VERSION)"
- 
+    cp SDK_VERSION /tmp/sdk_version.txt && \
+    python3 -m pip install -r scripts/requirements-base.txt
 
+# Instantiate west workspace and install tools
+RUN cd /opt/toolchains && \
+    west init -l zephyr && \
+    west update --narrow -o=--depth=1
 
+# Install module-specific blobs
+RUN cd /opt/toolchains && \
+    west blobs fetch hal_stm32
 
+#-------------------------------------------------------------------------------
+# Zephyr SDK
 
+# Install minimal Zephyr SDK
+RUN cd /opt/toolchains && \
+    ZEPHYR_SDK_VERSION=$(cat /tmp/sdk_version.txt) && \
+    echo "SDK version is ${ZEPHYR_SDK_VERSION}" && \
+    wget ${WGET_ARGS} https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZEPHYR_SDK_VERSION}/zephyr-sdk-${ZEPHYR_SDK_VERSION}_linux-${HOSTTYPE}_minimal.tar.xz && \
+    tar xf zephyr-sdk-${ZEPHYR_SDK_VERSION}_linux-${HOSTTYPE}_minimal.tar.xz && \
+    rm zephyr-sdk-${ZEPHYR_SDK_VERSION}_linux-${HOSTTYPE}_minimal.tar.xz && \
+    cd /opt/toolchains/zephyr-sdk-${ZEPHYR_SDK_VERSION} && \
+    bash setup.sh -c ${TOOLCHAIN_LIST}
 
+# Install host tools
+RUN ZEPHYR_SDK_VERSION=$(cat /tmp/sdk_version.txt) && \
+    cd /opt/toolchains/zephyr-sdk-${ZEPHYR_SDK_VERSION} && \
+    wget ${WGET_ARGS} https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v${ZEPHYR_SDK_VERSION}/hosttools_linux-${HOSTTYPE}.tar.xz && \
+    tar xf hosttools_linux-${HOSTTYPE}.tar.xz && \
+    rm hosttools_linux-${HOSTTYPE}.tar.xz && \
+    bash zephyr-sdk-${HOSTTYPE}-hosttools-standalone-*.sh -y -d .
 
+#-------------------------------------------------------------------------------
+# VS Code Server
 
-# install Zephyr SDK
-USER ${USERNAME}
-RUN mkdir /opt/zephyr/sdk
-WORKDIR /opt/zephyr/sdk
-RUN wget https://github.com/zephyrproject-rtos/meta-zephyr-sdk/releases/download/0.9.1/zephyr-sdk-0.9.1-setup.run
-RUN chmod +x zephyr-sdk-0.9.1-setup.run
-USER root
-RUN ./zephyr-sdk-0.9.1-setup.run
-USER zephyr
-ENV ZEPHYR_GCC_VARIANT zephyr
-ENV ZEPHYR_SDK_INSTALL_DIR /opt/zephyr-sdk/
+# Set VS Code Server environment variables
+ENV VS_CODE_SERVER_VERSION=${VS_CODE_SERVER_VERSION}
+ENV VS_CODE_SERVER_PORT=${VS_CODE_SERVER_PORT}
 
-# for open-ocd
-USER root
-RUN DEBIAN_FRONTEND=noninteractive apt-get install -y -q libtool automake pkg-config libusb-1.0-0 libusb-1.0-0-dev
-USER zephyr
-WORKDIR /opt/zephyr
-RUN git clone https://github.com/erwango/openocd-stm32.git
-WORKDIR /opt/zephyr/openocd-stm32
-RUN ./bootstrap
-RUN ./configure --enable-maintainer-mode --enable-stlink
-RUN make
+# Install VS Code Server
+RUN cd /tmp && \
+    wget ${WGET_ARGS} https://code-server.dev/install.sh && \
+    chmod +x install.sh && \
+    bash install.sh --version ${VS_CODE_SERVER_VERSION}
 
-# set initial path
-WORKDIR /opt/zephyr
+# Download VS Code extensions (code-server extension manager does not work well)
+RUN cd /tmp && \
+    if [ "$TARGETARCH" = "amd64" ]; then \
+        wget ${WGET_ARGS} https://github.com/microsoft/vscode-cpptools/releases/download/v${VS_CODE_EXT_CPPTOOLS_VERSION}/cpptools-linux-x64.vsix -O cpptools.vsix; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+        wget ${WGET_ARGS} https://github.com/microsoft/vscode-cpptools/releases/download/v${VS_CODE_EXT_CPPTOOLS_VERSION}/cpptools-linux-arm64.vsix -O cpptools.vsix; \
+    else \
+        echo "Unsupported architecture"; \
+        exit 1; \
+    fi && \
+    wget ${WGET_ARGS} https://github.com/microsoft/vscode-cmake-tools/releases/download/v${VS_CODE_EXT_CMAKETOOLS_VERSION}/cmake-tools.vsix -O cmake-tools.vsix && \
+    wget --compression=gzip ${WGET_ARGS} https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-vscode/vsextensions/hexeditor/${VS_CODE_EXT_HEX_EDITOR_VERSION}/vspackage -O hexeditor.vsix
+
+# Install extensions
+RUN cd /tmp && \
+    code-server --install-extension cpptools.vsix && \
+    code-server --install-extension cmake-tools.vsix && \
+    code-server --install-extension hexeditor.vsix
+
+# Clean up
+RUN cd /tmp && \
+    rm install.sh && \
+    rm cpptools.vsix && \
+    rm cmake-tools.vsix && \
+    rm hexeditor.vsix
+
+#-------------------------------------------------------------------------------
+# Initialise system locale (required by menuconfig)
+
+RUN sed -i '/^#.*en_US.UTF-8/s/^#//' /etc/locale.gen && \
+    locale-gen en_US.UTF-8 && \
+    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# Use the "dark" theme for Midnight Commander
+ENV MC_SKIN=dark
+
+#-------------------------------------------------------------------------------
+# Entrypoint
+
+# Activate the Python and Zephyr environments for shell sessions
+RUN echo "source ${VIRTUAL_ENV}/bin/activate" >> /${USERNAME}/.bashrc && \
+    echo "source /opt/toolchains/zephyr/zephyr-env.sh" >> /${USERNAME}/.bashrc && \
+    mkdir -p /opt/zephyr/workspace
+
+# Custom entrypoint
+WORKDIR /opt/zephyr/workspace
